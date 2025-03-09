@@ -21,9 +21,10 @@ export interface Oil {
 export interface Recipe {
   id: string
   name: string
+  totalOilWeight: number  // Neue Eigenschaft für die Gesamtfettmenge
   oils: {
     oilId: string
-    amount: number
+    percentage: number    // Statt amount verwenden wir jetzt percentage (0-100)
   }[]
   lyeType: 'NaOH' | 'KOH'
   superFat: number
@@ -33,89 +34,144 @@ export interface Recipe {
   updatedAt: Date
 }
 
-function createRecipeStore() {
-  const { subscribe, update } = writable<{
-    recipes: Recipe[]
-    activeRecipe: Recipe | null
-  }>({
-    recipes: [],
-    activeRecipe: null
-  });
+const STORAGE_KEY = 'seifenrechner_recipes';
 
-  return {
-    subscribe,
+function loadFromStorage(): { recipes: Recipe[]; activeRecipe: Recipe | null; unsavedChanges: boolean } {
+  try {
+    const stored = localStorage.getItem(STORAGE_KEY);
+    if (!stored) return { recipes: [], activeRecipe: null, unsavedChanges: false };
+
+    const data = JSON.parse(stored);
+    const recipes = data.recipes.map((recipe: any) => ({
+      ...recipe,
+      createdAt: new Date(recipe.createdAt),
+      updatedAt: new Date(recipe.updatedAt)
+    }));
     
-    addRecipe: (newRecipe: Omit<Recipe, 'id' | 'createdAt' | 'updatedAt'>) => update(store => {
-      const recipe = {
-        ...newRecipe,
-        id: crypto.randomUUID(),
-        createdAt: new Date(),
-        updatedAt: new Date()
-      };
-      return {
-        ...store,
-        recipes: [...store.recipes, recipe],
-        activeRecipe: recipe  // Setze das neue Rezept als aktiv
-      };
-    }),
+    const activeRecipe = data.activeRecipe 
+      ? {
+          ...data.activeRecipe,
+          createdAt: new Date(data.activeRecipe.createdAt),
+          updatedAt: new Date(data.activeRecipe.updatedAt)
+        }
+      : null;
 
-    updateRecipe: (id: string, updatedRecipe: Partial<Recipe>) => update(store => {
-      const updatedRecipes = store.recipes.map(recipe => 
-        recipe.id === id 
-          ? { ...recipe, ...updatedRecipe, updatedAt: new Date() }
-          : recipe
-      );
-      
-      // Aktualisiere auch das aktive Rezept
-      const updatedActiveRecipe = store.activeRecipe?.id === id
-        ? { ...store.activeRecipe, ...updatedRecipe, updatedAt: new Date() }
-        : store.activeRecipe;
+    return { recipes, activeRecipe, unsavedChanges: false };
+  } catch (e) {
+    console.error('Fehler beim Laden der Rezepte:', e);
+    return { recipes: [], activeRecipe: null, unsavedChanges: false };
+  }
+}
 
-      return {
-        recipes: updatedRecipes,
-        activeRecipe: updatedActiveRecipe
-      };
-    }),
+function createRecipeStore() {
+  const { subscribe, set, update } = writable<{
+    recipes: Recipe[];
+    activeRecipe: Recipe | null;
+    unsavedChanges: boolean;
+  }>(loadFromStorage());
 
-    deleteRecipe: (id: string) => update(store => ({
-      ...store,
-      recipes: store.recipes.filter(recipe => recipe.id !== id)
-    })),
+  const store = {
+    subscribe,
+    addRecipe: (recipe: Omit<Recipe, 'id' | 'createdAt' | 'updatedAt'>) => {
+      update(state => {
+        const newRecipe: Recipe = {
+          ...recipe,
+          id: crypto.randomUUID(),
+          createdAt: new Date(),
+          updatedAt: new Date()
+        };
+        return {
+          ...state,
+          recipes: [...state.recipes, newRecipe],
+          activeRecipe: newRecipe,
+          unsavedChanges: true
+        };
+      });
+    },
+    updateRecipe: (id: string, updates: Partial<Recipe>) => {
+      update(state => {
+        const recipeIndex = state.recipes.findIndex(recipe => recipe.id === id);
+        if (recipeIndex === -1) return state; // Rezept nicht gefunden
 
-    setActiveRecipe: (recipe: Recipe | null) => update(store => ({
-      ...store,
-      activeRecipe: recipe
-    })),
+        const currentRecipe = state.recipes[recipeIndex];
+        const updatedRecipe = { ...currentRecipe, ...updates, updatedAt: new Date() };
+        
+        // Protokolliere die Änderungen
+        console.log(`Aktualisiere Rezept: ${currentRecipe.name}`);
+        console.log('Aktuelle Werte:', currentRecipe);
+        console.log('Neue Werte:', updatedRecipe);
+
+        const updatedRecipes = state.recipes.map(recipe =>
+          recipe.id === id
+            ? updatedRecipe
+            : recipe
+        );
+
+        return {
+          ...state,
+          recipes: updatedRecipes,
+          activeRecipe: updatedRecipes.find(r => r.id === id) || state.activeRecipe,
+          unsavedChanges: true
+        };
+      });
+    },
+    saveChanges: () => {
+      update(state => {
+        try {
+          localStorage.setItem(STORAGE_KEY, JSON.stringify({
+            recipes: state.recipes,
+            activeRecipe: state.activeRecipe
+          }));
+          return { ...state, unsavedChanges: false };
+        } catch (error) {
+          console.error('Failed to save to localStorage:', error);
+          return state;
+        }
+      });
+    },
+    deleteRecipe: (id: string) => {
+      update(state => {
+        const newState = {
+          recipes: state.recipes.filter(recipe => recipe.id !== id),
+          activeRecipe: state.activeRecipe?.id === id ? null : state.activeRecipe,
+          unsavedChanges: true
+        };
+        return newState;
+      });
+    },
+    setActiveRecipe: (id: string) => {
+      update(state => {
+        if (state.unsavedChanges) {
+          // Verwerfe Änderungen
+          const savedState = loadFromStorage();
+          return {
+            ...savedState,
+            activeRecipe: savedState.recipes.find(r => r.id === id) || null
+          };
+        }
+        return {
+          ...state,
+          activeRecipe: state.recipes.find(r => r.id === id) || null
+        };
+      });
+    },
 
     calculateLye: (recipe: Recipe): number => {
-      // Berechne die benötigte Laugenmenge für jedes Öl
-      const totalLye = recipe.oils.reduce((sum, { oilId, amount }) => {
-        const oil = oils.find(o => o.id === oilId);
-        if (!oil) return sum;
+      const totalLye = recipe.oils.reduce((sum, oil) => {
+        const oilData = oils.find(o => o.id === oil.oilId);
+        if (!oilData) return sum;
         
-        // Wähle die richtige Verseifungszahl (NaOH oder KOH)
-        const sapValue = recipe.lyeType === 'NaOH' ? oil.sapNaoh : oil.sapKoh;
-        
-        // Berechne Laugenmenge für dieses Öl
-        return sum + (amount * sapValue);
+        const oilWeight = (oil.percentage / 100) * recipe.totalOilWeight;
+        const lyeSap = recipe.lyeType === 'NaOH' ? oilData.naohSap : oilData.kohSap;
+        return sum + (oilWeight * lyeSap);
       }, 0);
 
-      // Berücksichtige die Überfettung
-      return totalLye * (1 - (recipe.superFat / 100));
+      return totalLye * (1 - recipe.superFat / 100);
     },
 
-    calculateTotalWeight: (recipe: Recipe): number => {
-      const lyeAmount = recipeStore.calculateLye(recipe);
-      const waterAmount = lyeAmount * recipe.waterRatio;
-      const oilsAmount = recipe.oils.reduce((sum, { amount }) => sum + amount, 0);
-      
-      return lyeAmount + waterAmount + oilsAmount;
-    },
-
-    calculateProperties: (recipe: Recipe): Oil['properties'] => {
-      // Gesamtgewicht aller Öle
-      const totalOilWeight = recipe.oils.reduce((sum, { amount }) => sum + amount, 0);
-      if (totalOilWeight === 0) return {
+    calculateProperties: (recipe: Recipe) => {
+      const totalWeight = recipe.oils.reduce((sum, oil) => sum + oil.percentage, 0);
+      if (totalWeight === 0) return {
         hardness: 0,
         cleansing: 0,
         conditioning: 0,
@@ -125,23 +181,19 @@ function createRecipeStore() {
         ins: 0
       };
 
-      // Berechne gewichteten Durchschnitt für jede Eigenschaft
-      return recipe.oils.reduce((props, { oilId, amount }) => {
-        const oil = oils.find(o => o.id === oilId);
-        if (!oil) return props;
+      return recipe.oils.reduce((props, oil) => {
+        const oilData = oils.find(o => o.id === oil.oilId);
+        if (!oilData) return props;
 
-        // Prozentualer Anteil dieses Öls
-        const percentage = amount / totalOilWeight;
-
-        // Addiere gewichtete Eigenschaften
+        const factor = oil.percentage / totalWeight;
         return {
-          hardness: props.hardness + (oil.properties.hardness * percentage),
-          cleansing: props.cleansing + (oil.properties.cleansing * percentage),
-          conditioning: props.conditioning + (oil.properties.conditioning * percentage),
-          bubbly: props.bubbly + (oil.properties.bubbly * percentage),
-          creamy: props.creamy + (oil.properties.creamy * percentage),
-          iodine: props.iodine + (oil.properties.iodine * percentage),
-          ins: props.ins + (oil.properties.ins * percentage)
+          hardness: props.hardness + oilData.properties.hardness * factor,
+          cleansing: props.cleansing + oilData.properties.cleansing * factor,
+          conditioning: props.conditioning + oilData.properties.conditioning * factor,
+          bubbly: props.bubbly + oilData.properties.bubbly * factor,
+          creamy: props.creamy + oilData.properties.creamy * factor,
+          iodine: props.iodine + oilData.properties.iodine * factor,
+          ins: props.ins + oilData.properties.ins * factor
         };
       }, {
         hardness: 0,
@@ -152,8 +204,16 @@ function createRecipeStore() {
         iodine: 0,
         ins: 0
       });
+    },
+
+    calculateTotalWeight: (recipe: Recipe): number => {
+      const lyeAmount = store.calculateLye(recipe);
+      const waterAmount = lyeAmount * recipe.waterRatio;
+      return recipe.totalOilWeight + lyeAmount + waterAmount;
     }
   }
+
+  return store;
 }
 
 export const recipeStore = createRecipeStore()
